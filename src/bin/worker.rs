@@ -1,16 +1,18 @@
 use futures::StreamExt;
 use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions, QueueDeclareOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions, BasicQosOptions,
+    ExchangeDeclareOptions, QueueDeclareOptions,
 };
 use lapin::types::FieldTable;
-use lapin::{Connection, ConnectionProperties};
+use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
 use std::env;
 use std::error::Error;
-use vvx_worker::{MockTtsEngine, TaskMessage, TtsEngine};
+use vvx_worker::{MockTtsEngine, TaskMessage, TaskResultMessage, TtsEngine};
 
 const DEFAULT_QUEUE: &str = "vvx_tasks";
 const DEFAULT_AMQP: &str = "amqp://guest:guest@127.0.0.1:5672/%2f";
 const DEFAULT_API: &str = "http://127.0.0.1:8080/api/v1";
+const DEFAULT_RESULT_EXCHANGE: &str = "vvx_results";
 
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -42,6 +44,8 @@ async fn main() -> WorkerResult<()> {
     let api_base = env::var("VXMB_API").unwrap_or_else(|_| DEFAULT_API.to_string());
     let amqp_addr = env::var("AMQP_ADDR").unwrap_or_else(|_| DEFAULT_AMQP.to_string());
     let queue_name = env::var("TASK_QUEUE").unwrap_or_else(|_| DEFAULT_QUEUE.to_string());
+    let result_exchange = env::var("RESULT_EXCHANGE")
+        .unwrap_or_else(|_| DEFAULT_RESULT_EXCHANGE.to_string());
 
     let engine = MockTtsEngine::new(api_base.clone());
 
@@ -51,6 +55,18 @@ async fn main() -> WorkerResult<()> {
         .queue_declare(
             &queue_name,
             QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    channel
+        .exchange_declare(
+            &result_exchange,
+            ExchangeKind::Topic,
+            ExchangeDeclareOptions {
                 durable: true,
                 ..Default::default()
             },
@@ -86,17 +102,63 @@ async fn main() -> WorkerResult<()> {
     while let Some(delivery) = consumer.next().await {
         match delivery {
             Ok(delivery) => {
-                if let Err(err) = handle_delivery(&engine, engine_id, delivery.data.as_ref()).await
+                let task: TaskMessage = match serde_json::from_slice(delivery.data.as_ref()) {
+                    Ok(message) => message,
+                    Err(err) => {
+                        eprintln!("engine {}: invalid task payload: {}", engine_id, err);
+                        delivery.ack(BasicAckOptions::default()).await?;
+                        continue;
+                    }
+                };
+
+                let process_result = handle_delivery(&engine, engine_id, &task).await;
+                let success = process_result.is_ok();
+                let error = process_result.err().map(|err| err.to_string());
+
+                let result_message = TaskResultMessage {
+                    eval_id: task.eval_id.clone(),
+                    task_id: task.task_id.clone(),
+                    engine_id,
+                    speaker_id: task.speaker_id,
+                    success,
+                    error,
+                };
+
+                if let Err(err) = publish_result(&channel, &result_exchange, &result_message).await
                 {
-                    eprintln!("engine {}: {}", engine_id, err);
+                    eprintln!(
+                        "engine {}: failed to publish result for task {}: {}",
+                        engine_id, result_message.task_id, err
+                    );
+                    delivery
+                        .nack(BasicNackOptions {
+                            requeue: true,
+                            multiple: false,
+                        })
+                        .await?;
+                    continue;
+                }
+
+                if result_message.success {
+                    println!(
+                        "engine {} completed task {} (speaker {})",
+                        engine_id, result_message.task_id, result_message.speaker_id
+                    );
+                    delivery.ack(BasicAckOptions::default()).await?;
+                } else {
+                    eprintln!(
+                        "engine {} failed task {} (speaker {}): {}",
+                        engine_id,
+                        result_message.task_id,
+                        result_message.speaker_id,
+                        result_message.error.as_deref().unwrap_or("unknown error")
+                    );
                     delivery
                         .nack(BasicNackOptions {
                             requeue: false,
                             multiple: false,
                         })
                         .await?;
-                } else {
-                    delivery.ack(BasicAckOptions::default()).await?;
                 }
             }
             Err(err) => {
@@ -120,16 +182,8 @@ fn parse_engine_id(value: &str) -> Result<u32, Box<dyn Error + Send + Sync>> {
 async fn handle_delivery(
     engine: &MockTtsEngine,
     engine_id: u32,
-    payload: &[u8],
+    message: &TaskMessage,
 ) -> Result<(), vvx_worker::EngineError> {
-    let message: TaskMessage = match serde_json::from_slice(payload) {
-        Ok(message) => message,
-        Err(err) => {
-            eprintln!("engine {}: invalid task payload: {}", engine_id, err);
-            return Ok(());
-        }
-    };
-
     engine
         .set_speaker(&message.eval_id, engine_id, message.speaker_id)
         .await?;
@@ -142,10 +196,24 @@ async fn handle_delivery(
         )
         .await?;
 
-    println!(
-        "engine {} completed task {} (speaker {})",
-        engine_id, message.task_id, message.speaker_id
-    );
+    Ok(())
+}
 
+async fn publish_result(
+    channel: &Channel,
+    exchange: &str,
+    result: &TaskResultMessage,
+) -> WorkerResult<()> {
+    let payload = serde_json::to_vec(result)?;
+    channel
+        .basic_publish(
+            exchange,
+            &result.eval_id,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default().with_delivery_mode(2),
+        )
+        .await?
+        .await?;
     Ok(())
 }
