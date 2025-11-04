@@ -1,3 +1,4 @@
+use clap::Parser;
 use futures::StreamExt;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, ExchangeDeclareOptions,
@@ -9,7 +10,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::error::Error;
+use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
+use uuid::Uuid;
 use vvx_worker::{TaskMessage, TaskResultMessage};
 
 const DEFAULT_QUEUE: &str = "vvx_tasks";
@@ -18,6 +22,33 @@ const DEFAULT_API: &str = "http://127.0.0.1:8080/api/v1";
 const DEFAULT_RESULT_EXCHANGE: &str = "vvx_results";
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "vvx-client",
+    about = "Client for dispatching VOICEVOX tasks via RabbitMQ"
+)]
+struct Args {
+    /// Use the legacy mock benchmarking API workflow.
+    #[arg(long)]
+    mock: bool,
+
+    /// Speaker/style identifier for VOICEVOX synthesis.
+    #[arg(long)]
+    speaker_id: Option<u32>,
+
+    /// Text to synthesize with VOICEVOX.
+    #[arg(long)]
+    text: Option<String>,
+
+    /// Directory where synthesized audio files should be written.
+    #[arg(long, default_value = ".")]
+    output_dir: PathBuf,
+
+    /// Override the output filename (defaults to <eval_id>.wav).
+    #[arg(long)]
+    result_filename: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct EvaluationResponse {
@@ -48,17 +79,32 @@ struct MetricsResponse {
 
 #[tokio::main]
 async fn main() -> ClientResult<()> {
+    let args = Args::parse();
+
     let api_base = env::var("VXMB_API").unwrap_or_else(|_| DEFAULT_API.to_string());
     let amqp_addr = env::var("AMQP_ADDR").unwrap_or_else(|_| DEFAULT_AMQP.to_string());
     let queue_name = env::var("TASK_QUEUE").unwrap_or_else(|_| DEFAULT_QUEUE.to_string());
-    let result_exchange = env::var("RESULT_EXCHANGE")
-        .unwrap_or_else(|_| DEFAULT_RESULT_EXCHANGE.to_string());
+    let result_exchange =
+        env::var("RESULT_EXCHANGE").unwrap_or_else(|_| DEFAULT_RESULT_EXCHANGE.to_string());
 
+    if args.mock {
+        run_mock(&api_base, &amqp_addr, &queue_name, &result_exchange).await
+    } else {
+        run_voicevox(&args, &amqp_addr, &queue_name, &result_exchange).await
+    }
+}
+
+async fn run_mock(
+    api_base: &str,
+    amqp_addr: &str,
+    queue_name: &str,
+    result_exchange: &str,
+) -> ClientResult<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let evaluation = create_evaluation(&http_client, &api_base).await?;
+    let evaluation = create_evaluation(&http_client, api_base).await?;
     if evaluation.config.engine_count == 0 {
         return Err("engine_count reported as zero".into());
     }
@@ -68,11 +114,11 @@ async fn main() -> ClientResult<()> {
         evaluation.eval_id, evaluation.config.engine_count
     );
 
-    let connection = Connection::connect(&amqp_addr, ConnectionProperties::default()).await?;
+    let connection = Connection::connect(amqp_addr, ConnectionProperties::default()).await?;
     let channel = connection.create_channel().await?;
     channel
         .queue_declare(
-            &queue_name,
+            queue_name,
             QueueDeclareOptions {
                 durable: true,
                 ..Default::default()
@@ -83,7 +129,7 @@ async fn main() -> ClientResult<()> {
 
     channel
         .exchange_declare(
-            &result_exchange,
+            result_exchange,
             ExchangeKind::Topic,
             ExchangeDeclareOptions {
                 durable: true,
@@ -111,7 +157,7 @@ async fn main() -> ClientResult<()> {
     channel
         .queue_bind(
             &result_queue,
-            &result_exchange,
+            result_exchange,
             &evaluation.eval_id,
             QueueBindOptions::default(),
             FieldTable::default(),
@@ -121,7 +167,7 @@ async fn main() -> ClientResult<()> {
     let mut total_tasks = 0usize;
 
     loop {
-        let tasks = fetch_tasks(&http_client, &api_base, &evaluation.eval_id).await?;
+        let tasks = fetch_tasks(&http_client, api_base, &evaluation.eval_id).await?;
         if tasks.is_empty() {
             break;
         }
@@ -132,13 +178,16 @@ async fn main() -> ClientResult<()> {
                 eval_id: evaluation.eval_id.clone(),
                 speaker_id: task.speaker_id,
                 task_id: task.task_id,
+                text: None,
+                output_dir: None,
+                result_filename: None,
             };
 
             let payload = serde_json::to_vec(&message)?;
             channel
                 .basic_publish(
                     "",
-                    &queue_name,
+                    queue_name,
                     BasicPublishOptions::default(),
                     &payload,
                     BasicProperties::default().with_delivery_mode(2),
@@ -186,8 +235,15 @@ async fn main() -> ClientResult<()> {
                     completed += 1;
                     if result.success {
                         println!(
-                            "Task {} succeeded on engine {} (speaker {})",
-                            result.task_id, result.engine_id, result.speaker_id
+                            "Task {} succeeded on engine {} (speaker {}){}",
+                            result.task_id,
+                            result.engine_id,
+                            result.speaker_id,
+                            result
+                                .output_file
+                                .as_ref()
+                                .map(|path| format!(" -> {}", path))
+                                .unwrap_or_default()
                         );
                     } else {
                         failures += 1;
@@ -231,10 +287,195 @@ async fn main() -> ClientResult<()> {
         println!("No tasks returned for evaluation {}", evaluation.eval_id);
     }
 
-    let metrics = fetch_metrics(&http_client, &api_base, &evaluation.eval_id).await?;
+    let metrics = fetch_metrics(&http_client, api_base, &evaluation.eval_id).await?;
     println!("Final score: {}", metrics.score);
 
     connection.close(0, "").await?;
+
+    Ok(())
+}
+
+async fn run_voicevox(
+    args: &Args,
+    amqp_addr: &str,
+    queue_name: &str,
+    result_exchange: &str,
+) -> ClientResult<()> {
+    let speaker_id = match args.speaker_id {
+        Some(id) => id,
+        None => return Err("--speaker-id is required when not using --mock".into()),
+    };
+
+    let text = match args.text.as_ref() {
+        Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => return Err("--text is required when not using --mock".into()),
+    };
+
+    let output_dir_path = if args.output_dir.is_absolute() {
+        args.output_dir.clone()
+    } else {
+        env::current_dir()?.join(&args.output_dir)
+    };
+
+    let output_dir = output_dir_path
+        .to_str()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "output directory path is not valid UTF-8",
+            )
+        })?
+        .to_owned();
+
+    let eval_id = Uuid::new_v4().to_string();
+    let task_id = eval_id.clone();
+    let result_filename = args
+        .result_filename
+        .clone()
+        .unwrap_or_else(|| format!("{}.wav", eval_id));
+
+    let message = TaskMessage {
+        eval_id: eval_id.clone(),
+        speaker_id,
+        task_id,
+        text: Some(text),
+        output_dir: Some(output_dir.clone()),
+        result_filename: Some(result_filename),
+    };
+
+    let connection = Connection::connect(amqp_addr, ConnectionProperties::default()).await?;
+    let channel = connection.create_channel().await?;
+    channel
+        .queue_declare(
+            queue_name,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    channel
+        .exchange_declare(
+            result_exchange,
+            ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    let ephemeral_queue = channel
+        .queue_declare(
+            "",
+            QueueDeclareOptions {
+                durable: false,
+                exclusive: true,
+                auto_delete: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    let result_queue = ephemeral_queue.name().to_string();
+
+    channel
+        .queue_bind(
+            &result_queue,
+            result_exchange,
+            &eval_id,
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+
+    let payload = serde_json::to_vec(&message)?;
+    channel
+        .basic_publish(
+            "",
+            queue_name,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default().with_delivery_mode(2),
+        )
+        .await?;
+
+    println!(
+        "Dispatched synthesis request {} for speaker {}",
+        message.eval_id, message.speaker_id
+    );
+
+    let consumer_tag = format!("vvx-client-{}", eval_id);
+    let mut consumer = channel
+        .basic_consume(
+            &result_queue,
+            &consumer_tag,
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+
+    let mut received = false;
+    let mut failure: Option<String> = None;
+
+    while let Some(result_delivery) = consumer.next().await {
+        match result_delivery {
+            Ok(delivery) => {
+                let result: TaskResultMessage = match serde_json::from_slice(delivery.data.as_ref())
+                {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        eprintln!("invalid result payload: {}", err);
+                        delivery.ack(BasicAckOptions::default()).await?;
+                        continue;
+                    }
+                };
+
+                if result.eval_id != eval_id {
+                    delivery.ack(BasicAckOptions::default()).await?;
+                    continue;
+                }
+
+                received = true;
+                if result.success {
+                    let path = result
+                        .output_file
+                        .as_deref()
+                        .unwrap_or("<worker did not report output path>");
+                    println!("Synthesis complete: {}", path);
+                } else {
+                    let err = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error returned by worker".into());
+                    eprintln!(
+                        "Synthesis failed on engine {} (speaker {}): {}",
+                        result.engine_id, result.speaker_id, err
+                    );
+                    failure = Some(err);
+                }
+
+                delivery.ack(BasicAckOptions::default()).await?;
+                break;
+            }
+            Err(err) => {
+                eprintln!("error receiving result message: {}", err);
+            }
+        }
+    }
+
+    connection.close(0, "").await?;
+
+    if !received {
+        return Err("no result received for synthesis request".into());
+    }
+
+    if let Some(err) = failure {
+        return Err(format!("synthesis failed: {}", err).into());
+    }
 
     Ok(())
 }

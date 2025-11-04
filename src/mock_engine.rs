@@ -1,4 +1,7 @@
-use crate::tts::{EngineError, EngineResult, TtsEngine};
+use crate::{
+    tts::{EngineError, EngineResult, TtsEngine},
+    TaskMessage,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Serialize;
@@ -60,37 +63,32 @@ struct SynthesisRequest<'a> {
 
 #[async_trait]
 impl TtsEngine for MockTtsEngine {
-    async fn set_speaker(
+    async fn process_task(
         &self,
-        eval_id: &str,
         engine_id: u32,
-        speaker_id: u32,
-    ) -> EngineResult<()> {
+        message: &TaskMessage,
+    ) -> EngineResult<Option<String>> {
         let response = self
             .client
-            .put(self.speaker_url(eval_id, engine_id))
-            .json(&SpeakerRequest { speaker_id })
-            .send()
-            .await?;
-        Self::ensure_success(response).await
-    }
-
-    async fn synthesize(
-        &self,
-        eval_id: &str,
-        engine_id: u32,
-        speaker_id: u32,
-        task_id: &str,
-    ) -> EngineResult<()> {
-        let response = self
-            .client
-            .post(self.synthesis_url(eval_id, engine_id))
-            .json(&SynthesisRequest {
-                speaker_id,
-                task_id,
+            .put(self.speaker_url(&message.eval_id, engine_id))
+            .json(&SpeakerRequest {
+                speaker_id: message.speaker_id,
             })
             .send()
             .await?;
-        Self::ensure_success(response).await
+        Self::ensure_success(response).await?;
+
+        let response = self
+            .client
+            .post(self.synthesis_url(&message.eval_id, engine_id))
+            .json(&SynthesisRequest {
+                speaker_id: message.speaker_id,
+                task_id: &message.task_id,
+            })
+            .send()
+            .await?;
+        Self::ensure_success(response).await?;
+
+        Ok(None)
     }
 }

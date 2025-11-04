@@ -1,3 +1,5 @@
+use camino::Utf8PathBuf;
+use clap::Parser;
 use futures::StreamExt;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions, BasicQosOptions,
@@ -7,7 +9,11 @@ use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
 use std::env;
 use std::error::Error;
-use vvx_worker::{MockTtsEngine, TaskMessage, TaskResultMessage, TtsEngine};
+use std::path::PathBuf;
+use std::sync::Arc;
+use vvx_worker::{
+    MockTtsEngine, TaskMessage, TaskResultMessage, TtsEngine, VoicevoxConfig, VoicevoxTtsEngine,
+};
 
 const DEFAULT_QUEUE: &str = "vvx_tasks";
 const DEFAULT_AMQP: &str = "amqp://guest:guest@127.0.0.1:5672/%2f";
@@ -27,15 +33,43 @@ impl std::fmt::Display for WorkerConfigError {
 
 impl Error for WorkerConfigError {}
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "vvx-worker",
+    about = "RabbitMQ worker that performs VOICEVOX or mock synthesis"
+)]
+struct Args {
+    /// Engine identifier used when reporting results (falls back to ENGINE_ID env var)
+    #[arg(value_name = "ENGINE_ID")]
+    engine_id: Option<u32>,
+
+    /// Use the mock HTTP engine instead of VOICEVOX.
+    #[arg(long)]
+    mock: bool,
+
+    /// Path to the ONNX Runtime shared library.
+    #[arg(long)]
+    voicevox_onnx: Option<PathBuf>,
+
+    /// Path to the Open JTalk dictionary directory.
+    #[arg(long)]
+    voicevox_dict: Option<PathBuf>,
+
+    /// Directory containing VOICEVOX model assets (.vvm files or folders).
+    #[arg(long)]
+    voicevox_model_dir: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> WorkerResult<()> {
-    let mut args = env::args().skip(1);
-    let engine_id = if let Some(arg) = args.next() {
-        parse_engine_id(&arg)?
+    let args = Args::parse();
+
+    let engine_id = if let Some(id) = args.engine_id {
+        id
     } else {
         let env_value = env::var("ENGINE_ID").map_err(|_| {
             Box::new(WorkerConfigError(
-                "provide engine id as first argument or ENGINE_ID environment variable".into(),
+                "provide engine id as positional argument or ENGINE_ID environment variable".into(),
             )) as Box<dyn Error + Send + Sync>
         })?;
         parse_engine_id(&env_value)?
@@ -44,10 +78,15 @@ async fn main() -> WorkerResult<()> {
     let api_base = env::var("VXMB_API").unwrap_or_else(|_| DEFAULT_API.to_string());
     let amqp_addr = env::var("AMQP_ADDR").unwrap_or_else(|_| DEFAULT_AMQP.to_string());
     let queue_name = env::var("TASK_QUEUE").unwrap_or_else(|_| DEFAULT_QUEUE.to_string());
-    let result_exchange = env::var("RESULT_EXCHANGE")
-        .unwrap_or_else(|_| DEFAULT_RESULT_EXCHANGE.to_string());
+    let result_exchange =
+        env::var("RESULT_EXCHANGE").unwrap_or_else(|_| DEFAULT_RESULT_EXCHANGE.to_string());
 
-    let engine = MockTtsEngine::new(api_base.clone());
+    let engine: Arc<dyn TtsEngine> = if args.mock {
+        Arc::new(MockTtsEngine::new(api_base.clone()))
+    } else {
+        let config = build_voicevox_config(&args)?;
+        Arc::new(VoicevoxTtsEngine::new(config)?)
+    };
 
     let connection = Connection::connect(&amqp_addr, ConnectionProperties::default()).await?;
     let channel = connection.create_channel().await?;
@@ -111,9 +150,11 @@ async fn main() -> WorkerResult<()> {
                     }
                 };
 
-                let process_result = handle_delivery(&engine, engine_id, &task).await;
-                let success = process_result.is_ok();
-                let error = process_result.err().map(|err| err.to_string());
+                let process_result = engine.process_task(engine_id, &task).await;
+                let (success, output_file, error) = match process_result {
+                    Ok(path) => (true, path, None),
+                    Err(err) => (false, None, Some(err.to_string())),
+                };
 
                 let result_message = TaskResultMessage {
                     eval_id: task.eval_id.clone(),
@@ -122,6 +163,7 @@ async fn main() -> WorkerResult<()> {
                     speaker_id: task.speaker_id,
                     success,
                     error,
+                    output_file,
                 };
 
                 if let Err(err) = publish_result(&channel, &result_exchange, &result_message).await
@@ -141,8 +183,15 @@ async fn main() -> WorkerResult<()> {
 
                 if result_message.success {
                     println!(
-                        "engine {} completed task {} (speaker {})",
-                        engine_id, result_message.task_id, result_message.speaker_id
+                        "engine {} completed task {} (speaker {}){}",
+                        engine_id,
+                        result_message.task_id,
+                        result_message.speaker_id,
+                        result_message
+                            .output_file
+                            .as_ref()
+                            .map(|path| format!(" -> {}", path))
+                            .unwrap_or_default()
                     );
                     delivery.ack(BasicAckOptions::default()).await?;
                 } else {
@@ -179,24 +228,73 @@ fn parse_engine_id(value: &str) -> Result<u32, Box<dyn Error + Send + Sync>> {
     })
 }
 
-async fn handle_delivery(
-    engine: &MockTtsEngine,
-    engine_id: u32,
-    message: &TaskMessage,
-) -> Result<(), vvx_worker::EngineError> {
-    engine
-        .set_speaker(&message.eval_id, engine_id, message.speaker_id)
-        .await?;
-    engine
-        .synthesize(
-            &message.eval_id,
-            engine_id,
-            message.speaker_id,
-            &message.task_id,
-        )
-        .await?;
+fn build_voicevox_config(args: &Args) -> WorkerResult<VoicevoxConfig> {
+    let onnxruntime_path = args
+        .voicevox_onnx
+        .clone()
+        .or_else(|| env::var("VOICEVOX_ORT_LIB").ok().map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty());
 
-    Ok(())
+    if let Some(ref path) = onnxruntime_path {
+        if !path.exists() {
+            return Err(Box::new(WorkerConfigError(format!(
+                "onnx runtime library not found at {}",
+                path.display()
+            ))) as Box<dyn Error + Send + Sync>);
+        }
+    }
+
+    let dict_dir_path = args
+        .voicevox_dict
+        .clone()
+        .or_else(|| env::var("VOICEVOX_OPEN_JTALK_DIR").ok().map(PathBuf::from))
+        .ok_or_else(|| {
+            Box::new(WorkerConfigError(
+                "provide --voicevox-dict or VOICEVOX_OPEN_JTALK_DIR".into(),
+            )) as Box<dyn Error + Send + Sync>
+        })?;
+
+    if !dict_dir_path.exists() {
+        return Err(Box::new(WorkerConfigError(format!(
+            "open jtalk dictionary directory not found: {}",
+            dict_dir_path.display()
+        ))) as Box<dyn Error + Send + Sync>);
+    }
+
+    let dict_dir = Utf8PathBuf::from_path_buf(dict_dir_path).map_err(|_| {
+        Box::new(WorkerConfigError(
+            "Open JTalk dictionary path must be valid UTF-8".into(),
+        )) as Box<dyn Error + Send + Sync>
+    })?;
+
+    let model_dir_path = args
+        .voicevox_model_dir
+        .clone()
+        .or_else(|| env::var("VOICEVOX_MODEL_DIR").ok().map(PathBuf::from))
+        .ok_or_else(|| {
+            Box::new(WorkerConfigError(
+                "provide --voicevox-model-dir or VOICEVOX_MODEL_DIR".into(),
+            )) as Box<dyn Error + Send + Sync>
+        })?;
+
+    if !model_dir_path.exists() {
+        return Err(Box::new(WorkerConfigError(format!(
+            "voice model directory not found: {}",
+            model_dir_path.display()
+        ))) as Box<dyn Error + Send + Sync>);
+    }
+
+    let model_dir = Utf8PathBuf::from_path_buf(model_dir_path).map_err(|_| {
+        Box::new(WorkerConfigError(
+            "voice model directory path must be valid UTF-8".into(),
+        )) as Box<dyn Error + Send + Sync>
+    })?;
+
+    Ok(VoicevoxConfig {
+        onnxruntime_path,
+        open_jtalk_dict_dir: dict_dir,
+        model_dir,
+    })
 }
 
 async fn publish_result(
